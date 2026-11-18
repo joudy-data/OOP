@@ -1,74 +1,96 @@
+from contextlib import redirect_stdout
+from io import StringIO
+
 import streamlit as st
 
 from conversation import Conversation
 from exceptions import InvalidPromptError
 from main import build_manager
+from manager import ModelManager
+from models import GPTModel, LanguageModel
+from pricing import PricingPlan
+from tokenizer import Tokenizer
 
 
-st.set_page_config(page_title="Model Playground", page_icon="💬")
+st.set_page_config(page_title="Model Playground", page_icon="💬", layout="wide")
+st.markdown(
+    """
+    <style>
+    .playground-header {
+        border-radius: 18px;
+        padding: 26px 32px;
+        margin-bottom: 18px;
+        color: #f8fafc;
+        background: linear-gradient(115deg, #162344, #283569 68%, #3c427d);
+    }
+    .playground-header h1 {color: #ffffff; padding: 0; font-size: 2.2rem;}
+    .playground-header p {color: #dbe5fa; margin: 6px 0 0;}
+    [data-testid="stMetric"] {
+        border: 1px solid rgba(128,128,128,.35);
+        border-radius: 12px;
+        padding: 12px 16px;
+    }
+    </style>
+    <div class="playground-header">
+        <h1>Model Playground</h1>
+        <p>Manage GPT and Llama, test prompts, and inspect usage in a simulated workspace.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-if "manager" not in st.session_state:
-    st.session_state.manager = build_manager()
-    st.session_state.conversations = {}
-    st.session_state.usage = {}
-    st.session_state.chat_errors = {}
+state = st.session_state
+if "manager" not in state:
+    state.manager = build_manager()
+if "model_catalog" not in state:
+    state.model_catalog = dict(state.manager.models)
+if "conversations" not in state:
+    state.conversations = {}
+if "usage" not in state:
+    state.usage = {}
+if "chat_errors" not in state:
+    state.chat_errors = {}
 
-manager = st.session_state.manager
+manager = state.manager
+catalog = state.model_catalog
 
-with st.sidebar:
-    st.header("Model settings")
-    model_name = st.selectbox("Model", list(manager.models))
-    model = manager.get_model(model_name)
-    st.caption(f"{model.provider} · {model.max_tokens:,} token limit")
-    model.temperature = st.slider(
-        "Temperature", 0.0, 2.0, float(model.temperature), 0.1,
-        key=f"temperature_{model_name}",
-        help="The demo stores this setting. Simulated replies use a fixed format.",
-    )
-    model.is_active = st.toggle("Model active", value=model.is_active, key=f"active_{model_name}")
-    if st.button("Clear this conversation"):
-        st.session_state.conversations.pop(model_name, None)
-        st.session_state.usage.pop(model_name, None)
-        st.session_state.chat_errors.pop(model_name, None)
 
-if model_name not in st.session_state.conversations:
-    st.session_state.conversations[model_name] = Conversation(
-        list(manager.models).index(model_name) + 1, model
-    )
-    st.session_state.usage[model_name] = {"tokens": 0, "cost": 0.0}
+def status_of(model):
+    if manager.get_model(model.model_name) is None:
+        return "Removed"
+    return "Active" if model.is_active else "Inactive"
 
-conversation = st.session_state.conversations[model_name]
-usage = st.session_state.usage[model_name]
 
-st.title("Model Playground")
-st.caption("Simulated chat · One word counts as one input token")
+def usage_of(name):
+    return state.usage.get(name, {"tokens": 0, "cost": 0.0})
 
-turns, tokens, cost = st.columns(3)
-turns.metric("Messages sent", len(conversation.messages) // 2)
-tokens.metric("Input tokens", f"{usage['tokens']:,}")
-cost.metric("Estimated cost", f"${usage['cost']:.5f}")
 
-for message in conversation.messages:
-    with st.chat_message(message["role"]):
-        st.text(message["content"])
+def validate_input(model, prompt):
+    model.validate_prompt(prompt)
+    tokens = model.tokenizer.count_tokens(prompt)
+    if tokens > model.max_tokens:
+        raise InvalidPromptError(f"This model accepts up to {model.max_tokens:,} input tokens.")
+    return tokens
 
-if not model.is_active:
-    st.info("Turn on Model active in the sidebar to send a message.")
 
-error = st.session_state.chat_errors.pop(model_name, None)
-if error:
-    st.error(error)
+def capture_output(function, *args):
+    output = StringIO()
+    with redirect_stdout(output):
+        result = function(*args)
+    return result, output.getvalue().strip()
 
-prompt = st.chat_input(f"Message {model_name}", disabled=not model.is_active)
-if prompt is not None:
-    try:
-        model.validate_prompt(prompt)
-        token_count = model.tokenizer.count_tokens(prompt)
-        if token_count > model.max_tokens:
-            raise InvalidPromptError(f"This model accepts up to {model.max_tokens:,} input tokens.")
-        conversation.send_message(prompt)
-        usage["tokens"] += token_count
-        usage["cost"] += model.calculate_request_cost(prompt)
-    except InvalidPromptError as error:
-        st.session_state.chat_errors[model_name] = str(error)
-    st.rerun()
+
+def dashboard():
+    st.subheader("Usage overview")
+    counts = [len(chat.messages) // 2 for chat in state.conversations.values()]
+    usage = list(state.usage.values())
+    summary = st.columns(4)
+    summary[0].metric("Active models", f"{sum(m.is_active for m in manager.models.values())} / {len(manager.models)}")
+    summary[1].metric("Messages sent", sum(counts))
+    summary[2].metric("Input tokens", f"{sum(row['tokens'] for row in usage):,}")
+    summary[3].metric("Estimated cost", f"${sum(row['cost'] for row in usage):.5f}")
+
+    rows = []
+    for name, model in catalog.items():
+        chat = state.conversations.get(name)
+        rows.append({
