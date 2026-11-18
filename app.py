@@ -341,3 +341,4 @@ pages = {
     "OOP stage lab": stage_lab,
 }
 pages[page]()
+
